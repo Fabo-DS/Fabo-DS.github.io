@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>VR Experience – Meta Quest 3</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #000;
+      font-family: 'Segoe UI', sans-serif;
+      overflow: hidden;
+      color: #fff;
+    }
+    #overlay {
+      position: fixed; inset: 0;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      background: radial-gradient(ellipse at center, #0a0a2e 0%, #000 70%);
+      z-index: 10;
+      gap: 20px;
+      transition: opacity 0.8s;
+    }
+    #overlay h1 {
+      font-size: clamp(2rem, 5vw, 3.5rem);
+      font-weight: 900;
+      letter-spacing: -2px;
+      background: linear-gradient(135deg, #00d4ff, #7b2fff, #ff6b35);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      text-align: center;
+    }
+    #overlay p {
+      color: #aaa;
+      font-size: 1rem;
+      text-align: center;
+      max-width: 400px;
+    }
+    #enterVR {
+      padding: 16px 48px;
+      font-size: 1.1rem;
+      font-weight: 700;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      border: none;
+      border-radius: 50px;
+      background: linear-gradient(135deg, #00d4ff, #7b2fff);
+      color: #fff;
+      cursor: pointer;
+      box-shadow: 0 0 40px rgba(123,47,255,0.5);
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+    #enterVR:hover { transform: scale(1.05); box-shadow: 0 0 60px rgba(0,212,255,0.6); }
+    #enterVR:disabled { opacity: 0.4; cursor: not-allowed; }
+    #status { font-size: 0.85rem; color: #666; }
+    canvas { display: block; }
+    #info {
+      position: fixed; bottom: 20px; left: 50%;
+      transform: translateX(-50%);
+      background: rgba(0,0,0,0.6);
+      backdrop-filter: blur(10px);
+      border: 1px solid rgba(255,255,255,0.1);
+      padding: 10px 20px; border-radius: 20px;
+      font-size: 0.8rem; color: #aaa;
+      pointer-events: none; z-index: 5;
+    }
+  </style>
+</head>
+<body>
+  <div id="overlay">
+    <h1>COSMOS VR</h1>
+    <p>Una experiencia inmersiva de exploración espacial para Meta Quest 3. Navega entre nebulosas, planetas y estructuras cósmicas en 6DOF.</p>
+    <button id="enterVR">⬡ Entrar en VR</button>
+    <span id="status">Verificando soporte WebXR...</span>
+  </div>
+  <div id="info">Mueve la cabeza para explorar · Gatillo para interactuar</div>
+  <canvas id="canvas"></canvas>
+
+  <script>
+  // ─── State ───────────────────────────────────────────────────────────────
+  const canvas = document.getElementById('canvas');
+  const gl = canvas.getContext('webgl2', { xrCompatible: true });
+  const overlay = document.getElementById('overlay');
+  const statusEl = document.getElementById('status');
+  const enterBtn = document.getElementById('enterVR');
+
+  let xrSession = null, xrRefSpace = null, animId = null;
+  let t = 0;
+
+  // ─── Resize ───────────────────────────────────────────────────────────────
+  function resize() {
+    canvas.width = window.innerWidth * devicePixelRatio;
+    canvas.height = window.innerHeight * devicePixelRatio;
+    if (!xrSession) gl.viewport(0, 0, canvas.width, canvas.height);
+  }
+  window.addEventListener('resize', resize);
+  resize();
+
+  // ─── WebXR check ─────────────────────────────────────────────────────────
+  (async () => {
+    if (!navigator.xr) {
+      statusEl.textContent = '⚠ WebXR no disponible en este navegador.';
+      return;
+    }
+    const supported = await navigator.xr.isSessionSupported('immersive-vr');
+    if (supported) {
+      statusEl.textContent = '✓ Meta Quest 3 detectado – listo para VR';
+      enterBtn.disabled = false;
+    } else {
+      statusEl.textContent = 'Modo 3D de escritorio activo (sin headset)';
+      enterBtn.textContent = '▶ Explorar en 3D';
+      enterBtn.disabled = false;
+      startDesktopMode();
+    }
+  })();
+
+  // ─── Shaders ─────────────────────────────────────────────────────────────
+  const VERT = `#version 300 es
+  in vec3 aPos;
+  in vec3 aNorm;
+  in vec2 aUV;
+  uniform mat4 uMVP;
+  uniform mat4 uModel;
+  out vec3 vNorm;
+  out vec3 vPos;
+  out vec2 vUV;
+  void main(){
+    vec4 wp = uModel * vec4(aPos,1.0);
+    vPos = wp.xyz;
+    vNorm = mat3(uModel)*aNorm;
+    vUV = aUV;
+    gl_Position = uMVP * vec4(aPos,1.0);
+  }`;
+
+  const FRAG = `#version 300 es
+  precision highp float;
+  in vec3 vNorm; in vec3 vPos; in vec2 vUV;
+  uniform vec3 uColor;
+  uniform float uTime;
+  uniform int uType;   // 0=planet 1=star 2=nebula 3=ring
+  out vec4 fragColor;
+
+  float hash(vec2 p){ return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5); }
+  float noise(vec2 p){
+    vec2 i=floor(p), f=fract(p);
+    f=f*f*(3.0-2.0*f);
+    return mix(mix(hash(i),hash(i+vec2(1,0)),f.x),
+               mix(hash(i+vec2(0,1)),hash(i+vec2(1,1)),f.x),f.y);
+  }
+
+  void main(){
+    vec3 n = normalize(vNorm);
+    vec3 light = normalize(vec3(1,1,0.5));
+    float diff = max(dot(n,light),0.0)*0.8+0.2;
+
+    if(uType==0){ // Planet
+      float nx = noise(vUV*4.0+uTime*0.05);
+      float nx2 = noise(vUV*8.0-uTime*0.03);
+      vec3 c = mix(uColor, uColor*1.4+vec3(0.1,0.1,0.3), nx);
+      c = mix(c, vec3(1.0,0.95,0.9)*0.9, nx2*0.3);
+      float rim = 1.0-max(dot(n,normalize(vec3(0,0,1))),0.0);
+      c += uColor*rim*rim*0.4;
+      fragColor = vec4(c*diff,1.0);
+    }
+    else if(uType==1){ // Star / Sun glow
+      float glow = 1.0-length(vUV-0.5)*2.0;
+      glow = max(glow,0.0);
+      float pulse = 0.9+0.1*sin(uTime*3.0);
+      fragColor = vec4(uColor*glow*glow*pulse*3.0, glow*glow);
+    }
+    else if(uType==2){ // Nebula cloud
+      float n1=noise(vUV*3.0+uTime*0.02);
+      float n2=noise(vUV*6.0-uTime*0.01);
+      float a=(n1*n2)*0.6;
+      vec3 c=mix(uColor,uColor*vec3(1.5,0.8,2.0),n2);
+      fragColor=vec4(c,a);
+    }
+    else { // Ring
+      float d=length(vUV-0.5);
+      float ring=smoothstep(0.45,0.42,d)-smoothstep(0.28,0.31,d);
+      fragColor=vec4(uColor*1.2, ring*0.7);
+    }
+  }`;
+
+  // Star field shader
+  const STAR_VERT = `#version 300 es
+  in vec3 aPos;
+  in float aSize;
+  in float aBright;
+  uniform mat4 uVP;
+  out float vBright;
+  void main(){
+    vBright=aBright;
+    gl_Position=uVP*vec4(aPos,1.0);
+    gl_PointSize=aSize;
+  }`;
+  const STAR_FRAG = `#version 300 es
+  precision highp float;
+  in float vBright;
+  uniform float uTime;
+  out vec4 fragColor;
+  void main(){
+    vec2 c=gl_PointCoord-0.5;
+    float d=length(c);
+    if(d>0.5) discard;
+    float g=1.0-d*2.0;
+    float twinkle=0.7+0.3*sin(uTime*2.0+vBright*100.0);
+    fragColor=vec4(vec3(0.9,0.95,1.0)*g*g*vBright*twinkle, g*g);
+  }`;
+
+  // ─── GL helpers ───────────────────────────────────────────────────────────
+  function compileShader(src, type) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+      console.error(gl.getShaderInfoLog(s));
+    return s;
+  }
+  function makeProgram(vs, fs) {
+    const p = gl.createProgram();
+    gl.attachShader(p, compileShader(vs, gl.VERTEX_SHADER));
+    gl.attachShader(p, compileShader(fs, gl.FRAGMENT_SHADER));
+    gl.linkProgram(p);
+    return p;
+  }
+
+  const prog = makeProgram(VERT, FRAG);
+  const starProg = makeProgram(STAR_VERT, STAR_FRAG);
+
+  // ─── Geometry ─────────────────────────────────────────────────────────────
+  function sphere(latBands, lonBands) {
+    const pos=[], norm=[], uv=[], idx=[];
+    for(let lat=0;lat<=latBands;lat++){
+      const theta=lat*Math.PI/latBands, st=Math.sin(theta), ct=Math.cos(theta);
+      for(let lon=0;lon<=lonBands;lon++){
+        const phi=lon*2*Math.PI/lonBands, sp=Math.sin(phi), cp=Math.cos(phi);
+        pos.push(cp*st, ct, sp*st);
+        norm.push(cp*st, ct, sp*st);
+        uv.push(lon/lonBands, lat/latBands);
+      }
+    }
+    for(let lat=0;lat<latBands;lat++){
+      for(let lon=0;lon<lonBands;lon++){
+        const a=lat*(lonBands+1)+lon, b=a+lonBands+1;
+        idx.push(a,b,a+1, b,b+1,a+1);
+      }
+    }
+    return { pos: new Float32Array(pos), norm: new Float32Array(norm),
+             uv: new Float32Array(uv), idx: new Uint16Array(idx) };
+  }
+
+  function quad() {
+    return {
+      pos: new Float32Array([-1,-1,0, 1,-1,0, 1,1,0, -1,1,0]),
+      norm: new Float32Array([0,0,1,0,0,1,0,0,1,0,0,1]),
+      uv: new Float32Array([0,0,1,0,1,1,0,1]),
+      idx: new Uint16Array([0,1,2,0,2,3])
+    };
+  }
+
+  function makeVAO(geo, prog) {
+    const vao = gl.createVertexArray();
+    gl.bindVertexArray(vao);
+    const posLoc = gl.getAttribLocation(prog,'aPos');
+    const normLoc = gl.getAttribLocation(prog,'aNorm');
+    const uvLoc = gl.getAttribLocation(prog,'aUV');
+    const buf = (data) => { const b=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,b); gl.bufferData(gl.ARRAY_BUFFER,data,gl.STATIC_DRAW); return b; };
+    if(posLoc>=0){ buf(geo.pos); gl.enableVertexAttribArray(posLoc); gl.vertexAttribPointer(posLoc,3,gl.FLOAT,false,0,0); }
+    if(normLoc>=0){ buf(geo.norm); gl.enableVertexAttribArray(normLoc); gl.vertexAttribPointer(normLoc,3,gl.FLOAT,false,0,0); }
+    if(uvLoc>=0){ buf(geo.uv); gl.enableVertexAttribArray(uvLoc); gl.vertexAttribPointer(uvLoc,2,gl.FLOAT,false,0,0); }
+    const ib=gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,ib); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,geo.idx,gl.STATIC_DRAW);
+    gl.bindVertexArray(null);
+    return { vao, count: geo.idx.length };
+  }
+
+  const sphereGeo = sphere(32, 32);
+  const quadGeo = quad();
+  const sphereMesh = makeVAO(sphereGeo, prog);
+  const quadMesh = makeVAO(quadGeo, prog);
+
+  // ─── Stars ────────────────────────────────────────────────────────────────
+  function makeStars(n) {
+    const pos=[], size=[], bright=[];
+    for(let i=0;i<n;i++){
+      const u=Math.random(), v=Math.random();
+      const theta=2*Math.PI*u, phi=Math.acos(2*v-1);
+      const r=80+Math.random()*20;
+      pos.push(r*Math.sin(phi)*Math.cos(theta), r*Math.sin(phi)*Math.sin(theta), r*Math.cos(phi));
+      size.push(1+Math.random()*3);
+      bright.push(0.4+Math.random()*0.6);
+    }
+    const vao=gl.createVertexArray(); gl.bindVertexArray(vao);
+    const pb=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,pb);
+    gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(pos),gl.STATIC_DRAW);
+    const pl=gl.getAttribLocation(starProg,'aPos');
+    gl.enableVertexAttribArray(pl); gl.vertexAttribPointer(pl,3,gl.FLOAT,false,0,0);
+    const sb=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,sb);
+    gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(size),gl.STATIC_DRAW);
+    const sl=gl.getAttribLocation(starProg,'aSize');
+    gl.enableVertexAttribArray(sl); gl.vertexAttribPointer(sl,1,gl.FLOAT,false,0,0);
+    const bb=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,bb);
+    gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(bright),gl.STATIC_DRAW);
+    const bl=gl.getAttribLocation(starProg,'aBright');
+    gl.enableVertexAttribArray(bl); gl.vertexAttribPointer(bl,1,gl.FLOAT,false,0,0);
+    gl.bindVertexArray(null);
+    return { vao, count: n };
+  }
+  const stars = makeStars(2000);
+
+  // ─── Scene objects ────────────────────────────────────────────────────────
+  const planets = [
+    { pos:[0,0,-15],  r:2.5, color:[0.2,0.5,1.0],  speed:0.3,  type:0, ring:true },
+    { pos:[10,2,-20], r:1.5, color:[1.0,0.4,0.1],  speed:0.5,  type:0, ring:false },
+    { pos:[-12,0,-18],r:2.0, color:[0.3,0.8,0.4],  speed:0.2,  type:0, ring:false },
+    { pos:[0,4,-30],  r:4.0, color:[0.9,0.6,0.1],  speed:0.1,  type:0, ring:true  },
+    { pos:[0,0,0],    r:1.0, color:[1.0,0.85,0.4],  speed:0,    type:1, ring:false },
+  ];
+
+  const nebulae = [
+    { pos:[-20,5,-40], size:[30,20,1], color:[0.4,0.1,0.9] },
+    { pos:[25,-5,-35], size:[25,15,1], color:[0.1,0.5,0.8] },
+    { pos:[0,-15,-50], size:[40,25,1], color:[0.9,0.2,0.4] },
+  ];
+
+  // ─── Math helpers ─────────────────────────────────────────────────────────
+  function mat4() { return new Float32Array(16); }
+  function identity(m) {
+    m.fill(0); m[0]=m[5]=m[10]=m[15]=1; return m;
+  }
+  function perspective(m, fov, asp, near, far) {
+    const f=1/Math.tan(fov/2), nf=1/(near-far);
+    m.fill(0);
+    m[0]=f/asp; m[5]=f; m[10]=(far+near)*nf; m[11]=-1; m[14]=2*far*near*nf;
+    return m;
+  }
+  function multiply(out, a, b) {
+    const a00=a[0],a01=a[1],a02=a[2],a03=a[3],
+          a10=a[4],a11=a[5],a12=a[6],a13=a[7],
+          a20=a[8],a21=a[9],a22=a[10],a23=a[11],
+          a30=a[12],a31=a[13],a32=a[14],a33=a[15];
+    let b0,b1,b2,b3;
+    b0=b[0];b1=b[1];b2=b[2];b3=b[3];
+    out[0]=b0*a00+b1*a10+b2*a20+b3*a30;
+    out[1]=b0*a01+b1*a11+b2*a21+b3*a31;
+    out[2]=b0*a02+b1*a12+b2*a22+b3*a32;
+    out[3]=b0*a03+b1*a13+b2*a23+b3*a33;
+    b0=b[4];b1=b[5];b2=b[6];b3=b[7];
+    out[4]=b0*a00+b1*a10+b2*a20+b3*a30;
+    out[5]=b0*a01+b1*a11+b2*a21+b3*a31;
+    out[6]=b0*a02+b1*a12+b2*a22+b3*a32;
+    out[7]=b0*a03+b1*a13+b2*a23+b3*a33;
+    b0=b[8];b1=b[9];b2=b[10];b3=b[11];
+    out[8]=b0*a00+b1*a10+b2*a20+b3*a30;
+    out[9]=b0*a01+b1*a11+b2*a21+b3*a31;
+    out[10]=b0*a02+b1*a12+b2*a22+b3*a32;
+    out[11]=b0*a03+b1*a13+b2*a23+b3*a33;
+    b0=b[12];b1=b[13];b2=b[14];b3=b[15];
+    out[12]=b0*a00+b1*a10+b2*a20+b3*a30;
+    out[13]=b0*a01+b1*a11+b2*a21+b3*a31;
+    out[14]=b0*a02+b1*a12+b2*a22+b3*a32;
+    out[15]=b0*a03+b1*a13+b2*a23+b3*a33;
+    return out;
+  }
+  function translate(m, x, y, z) {
+    identity(m);
+    m[12]=x; m[13]=y; m[14]=z; return m;
+  }
+  function scale(m, x, y, z) {
+    identity(m); m[0]=x; m[5]=y; m[10]=z; return m;
+  }
+  function rotY(m, a) {
+    identity(m);
+    m[0]=Math.cos(a); m[2]=Math.sin(a);
+    m[8]=-Math.sin(a); m[10]=Math.cos(a);
+    return m;
+  }
+  function rotX(m, a) {
+    identity(m);
+    m[5]=Math.cos(a); m[6]=-Math.sin(a);
+    m[9]=Math.sin(a); m[10]=Math.cos(a);
+    return m;
+  }
+  function fromXRTransform(xrT) {
+    const m=mat4(), p=xrT.position, o=xrT.orientation;
+    const x=o.x,y=o.y,z=o.z,w=o.w;
+    m[0]=1-2*(y*y+z*z); m[1]=2*(x*y+w*z); m[2]=2*(x*z-w*y); m[3]=0;
+    m[4]=2*(x*y-w*z); m[5]=1-2*(x*x+z*z); m[6]=2*(y*z+w*x); m[7]=0;
+    m[8]=2*(x*z+w*y); m[9]=2*(y*z-w*x); m[10]=1-2*(x*x+y*y); m[11]=0;
+    m[12]=p.x; m[13]=p.y; m[14]=p.z; m[15]=1;
+    return m;
+  }
+  function invertView(m) {
+    // simple inverse for rigid body
+    const inv=mat4();
+    inv[0]=m[0];inv[1]=m[4];inv[2]=m[8];inv[3]=0;
+    inv[4]=m[1];inv[5]=m[5];inv[6]=m[9];inv[7]=0;
+    inv[8]=m[2];inv[9]=m[6];inv[10]=m[10];inv[11]=0;
+    inv[12]=-(m[12]*m[0]+m[13]*m[1]+m[14]*m[2]);
+    inv[13]=-(m[12]*m[4]+m[13]*m[5]+m[14]*m[6]);
+    inv[14]=-(m[12]*m[8]+m[13]*m[9]+m[14]*m[10]);
+    inv[15]=1;
+    return inv;
+  }
+
+  // ─── Desktop orbit cam ────────────────────────────────────────────────────
+  let desktopMode=false, camYaw=0, camPitch=0, lastMX=null, lastMY=null;
+  canvas.addEventListener('mousemove', e=>{
+    if(!desktopMode) return;
+    if(e.buttons & 1){
+      if(lastMX!==null){ camYaw+=(e.clientX-lastMX)*0.003; camPitch+=(e.clientY-lastMY)*0.003; }
+      lastMX=e.clientX; lastMY=e.clientY;
+    } else { lastMX=lastMY=null; }
+  });
+
+  function startDesktopMode(){ desktopMode=true; requestAnimationFrame(desktopLoop); }
+  function desktopLoop(ts){
+    if(!desktopMode) return;
+    t=ts*0.001;
+    const asp=canvas.width/canvas.height;
+    const proj=mat4(), view=mat4(), tmp=mat4(), rY=mat4(), rX=mat4();
+    perspective(proj, 1.2, asp, 0.1, 1000);
+    identity(view);
+    multiply(view, rotX(rX,camPitch), rotY(rY,camYaw));
+    view[14]=-2;
+    renderScene(proj, view, canvas.width, canvas.height);
+    requestAnimationFrame(desktopLoop);
+  }
+
+  // ─── Render ───────────────────────────────────────────────────────────────
+  const tmp0=mat4(),tmp1=mat4(),tmp2=mat4(),tmp3=mat4();
+
+  function renderScene(proj, view, w, h) {
+    gl.viewport(0, 0, w, h);
+    gl.clearColor(0,0,0,1);
+    gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+    gl.enable(gl.DEPTH_TEST);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+
+    const vp=multiply(tmp0, proj, view);
+
+    // Stars
+    gl.useProgram(starProg);
+    gl.uniformMatrix4fv(gl.getUniformLocation(starProg,'uVP'),false,vp);
+    gl.uniform1f(gl.getUniformLocation(starProg,'uTime'),t);
+    gl.bindVertexArray(stars.vao);
+    gl.drawArrays(gl.POINTS,0,stars.count);
+
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+    // Nebulae
+    gl.useProgram(prog);
+    gl.uniform1i(gl.getUniformLocation(prog,'uType'),2);
+    gl.uniform1f(gl.getUniformLocation(prog,'uTime'),t);
+    for(const nb of nebulae){
+      const model=tmp1, s=tmp2, tr=tmp3;
+      translate(tr,...nb.pos);
+      scale(s,...nb.size);
+      multiply(model,tr,s);
+      const mvp=multiply(tmp0,vp,model);
+      // recompute vp
+      const vp2=multiply(mat4(),proj,view);
+      const mvp2=multiply(mat4(),vp2,model);
+      gl.uniformMatrix4fv(gl.getUniformLocation(prog,'uMVP'),false,mvp2);
+      gl.uniformMatrix4fv(gl.getUniformLocation(prog,'uModel'),false,model);
+      gl.uniform3fv(gl.getUniformLocation(prog,'uColor'),nb.color);
+      gl.bindVertexArray(quadMesh.vao);
+      gl.drawElements(gl.TRIANGLES,quadMesh.count,gl.UNSIGNED_SHORT,0);
+    }
+
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
+    // Planets & sun
+    gl.uniform1f(gl.getUniformLocation(prog,'uTime'),t);
+    for(const pl of planets){
+      const px=pl.pos[0]+Math.sin(t*pl.speed)*0.5;
+      const pz=pl.pos[2]+Math.cos(t*pl.speed)*0.5;
+      const py=pl.pos[1]+Math.sin(t*pl.speed*0.7)*0.2;
+
+      const tr=mat4(), sc=mat4(), ry=mat4(), model=mat4(), model2=mat4();
+      translate(tr,px,py,pz);
+      scale(sc,pl.r,pl.r,pl.r);
+      rotY(ry,t*0.2);
+      multiply(model2,tr,sc);
+      multiply(model,model2,ry);
+
+      const vp2=multiply(mat4(),proj,view);
+      const mvp=multiply(mat4(),vp2,model);
+      gl.useProgram(prog);
+      gl.uniform1i(gl.getUniformLocation(prog,'uType'),pl.type);
+      gl.uniformMatrix4fv(gl.getUniformLocation(prog,'uMVP'),false,mvp);
+      gl.uniformMatrix4fv(gl.getUniformLocation(prog,'uModel'),false,model);
+      gl.uniform3fv(gl.getUniformLocation(prog,'uColor'),pl.color);
+      gl.bindVertexArray(sphereMesh.vao);
+      gl.drawElements(gl.TRIANGLES,sphereMesh.count,gl.UNSIGNED_SHORT,0);
+
+      // Ring
+      if(pl.ring){
+        const rsc=mat4(), rtr=mat4(), rrx=mat4(), rmodel=mat4(), rmodel2=mat4();
+        translate(rtr,px,py,pz);
+        scale(rsc,pl.r*2.2,pl.r*2.2,1);
+        rotX(rrx,1.1);
+        multiply(rmodel2,rtr,rrx);
+        multiply(rmodel,rmodel2,rsc);
+        const rmvp=multiply(mat4(),vp2,rmodel);
+        gl.uniform1i(gl.getUniformLocation(prog,'uType'),3);
+        gl.uniformMatrix4fv(gl.getUniformLocation(prog,'uMVP'),false,rmvp);
+        gl.uniformMatrix4fv(gl.getUniformLocation(prog,'uModel'),false,rmodel);
+        gl.uniform3fv(gl.getUniformLocation(prog,'uColor'),pl.color);
+        gl.bindVertexArray(quadMesh.vao);
+        gl.drawElements(gl.TRIANGLES,quadMesh.count,gl.UNSIGNED_SHORT,0);
+      }
+    }
+  }
+
+  // ─── Enter VR ─────────────────────────────────────────────────────────────
+  enterBtn.addEventListener('click', async () => {
+    if (!navigator.xr) { startDesktopMode(); return; }
+    const supported = await navigator.xr.isSessionSupported('immersive-vr');
+    if (!supported) { startDesktopMode(); return; }
+
+    xrSession = await navigator.xr.requestSession('immersive-vr', {
+      requiredFeatures: ['local-floor'],
+      optionalFeatures: ['bounded-floor']
+    });
+    xrSession.addEventListener('end', () => { xrSession=null; overlay.style.opacity=1; overlay.style.pointerEvents='all'; });
+
+    const layer = new XRWebGLLayer(xrSession, gl);
+    xrSession.updateRenderState({ baseLayer: layer });
+    xrRefSpace = await xrSession.requestReferenceSpace('local-floor');
+
+    overlay.style.opacity = 0;
+    overlay.style.pointerEvents = 'none';
+
+    xrSession.requestAnimationFrame(vrLoop);
+  });
+
+  function vrLoop(time, frame) {
+    if (!xrSession) return;
+    xrSession.requestAnimationFrame(vrLoop);
+    t = time * 0.001;
+
+    const pose = frame.getViewerPose(xrRefSpace);
+    if (!pose) return;
+
+    const fb = xrSession.renderState.baseLayer.framebuffer;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+
+    for (const view of pose.views) {
+      const vp = xrSession.renderState.baseLayer.getViewport(view);
+      const projMat = view.projectionMatrix;
+      const viewMat = invertView(fromXRTransform(view.transform));
+      renderScene(projMat, viewMat, vp.width, vp.height);
+      gl.viewport(vp.x, vp.y, vp.width, vp.height);
+    }
+  }
+  </script>
+</body>
+</html>
