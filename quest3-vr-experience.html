@@ -64,6 +64,21 @@
       font-size: 0.8rem; color: #aaa;
       pointer-events: none; z-index: 5;
     }
+    #exitVR {
+      display: none;
+      position: fixed; top: 20px; right: 20px;
+      padding: 14px 32px;
+      font-size: 1rem; font-weight: 700;
+      letter-spacing: 1px; text-transform: uppercase;
+      border: 2px solid rgba(255,80,80,0.8);
+      border-radius: 50px;
+      background: rgba(180,0,0,0.5);
+      backdrop-filter: blur(10px);
+      color: #fff; cursor: pointer; z-index: 20;
+      box-shadow: 0 0 20px rgba(255,0,0,0.4);
+      transition: background 0.2s, box-shadow 0.2s;
+    }
+    #exitVR:hover { background: rgba(220,0,0,0.8); box-shadow: 0 0 40px rgba(255,0,0,0.7); }
   </style>
 </head>
 <body>
@@ -73,6 +88,7 @@
     <button id="enterVR">⬡ Entrar en VR</button>
     <span id="status">Verificando soporte WebXR...</span>
   </div>
+  <button id="exitVR">✕ Salir de VR</button>
   <div id="info">Mueve la cabeza para explorar · Gatillo para interactuar</div>
   <canvas id="canvas"></canvas>
 
@@ -423,6 +439,9 @@
     identity(view);
     multiply(view, rotX(rX,camPitch), rotY(rY,camYaw));
     view[14]=-2;
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.clearColor(0,0,0,1);
+    gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
     renderScene(proj, view, canvas.width, canvas.height);
     requestAnimationFrame(desktopLoop);
   }
@@ -431,9 +450,6 @@
   const tmp0=mat4(),tmp1=mat4(),tmp2=mat4(),tmp3=mat4();
 
   function renderScene(proj, view, w, h) {
-    gl.viewport(0, 0, w, h);
-    gl.clearColor(0,0,0,1);
-    gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
     gl.enable(gl.DEPTH_TEST);
     gl.enable(gl.BLEND);
     gl.blendFunc(gl.SRC_ALPHA, gl.ONE);
@@ -514,6 +530,12 @@
   }
 
   // ─── Enter VR ─────────────────────────────────────────────────────────────
+  const exitBtn = document.getElementById('exitVR');
+
+  exitBtn.addEventListener('click', () => {
+    if (xrSession) xrSession.end();
+  });
+
   enterBtn.addEventListener('click', async () => {
     if (!navigator.xr) { startDesktopMode(); return; }
     const supported = await navigator.xr.isSessionSupported('immersive-vr');
@@ -521,9 +543,15 @@
 
     xrSession = await navigator.xr.requestSession('immersive-vr', {
       requiredFeatures: ['local-floor'],
-      optionalFeatures: ['bounded-floor']
+      optionalFeatures: ['bounded-floor', 'hand-tracking']
     });
-    xrSession.addEventListener('end', () => { xrSession=null; overlay.style.opacity=1; overlay.style.pointerEvents='all'; });
+
+    xrSession.addEventListener('end', () => {
+      xrSession = null;
+      overlay.style.opacity = 1;
+      overlay.style.pointerEvents = 'all';
+      exitBtn.style.display = 'none';
+    });
 
     const layer = new XRWebGLLayer(xrSession, gl);
     xrSession.updateRenderState({ baseLayer: layer });
@@ -531,6 +559,7 @@
 
     overlay.style.opacity = 0;
     overlay.style.pointerEvents = 'none';
+    exitBtn.style.display = 'block';
 
     xrSession.requestAnimationFrame(vrLoop);
   });
@@ -543,15 +572,20 @@
     const pose = frame.getViewerPose(xrRefSpace);
     if (!pose) return;
 
-    const fb = xrSession.renderState.baseLayer.framebuffer;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    const baseLayer = xrSession.renderState.baseLayer;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, baseLayer.framebuffer);
+
+    // Clear once for the full stereo framebuffer
+    gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
     for (const view of pose.views) {
-      const vp = xrSession.renderState.baseLayer.getViewport(view);
+      const viewport = baseLayer.getViewport(view);
+      // ⚠️ Set viewport BEFORE rendering — this was the left-eye-only bug
+      gl.viewport(viewport.x, viewport.y, viewport.width, viewport.height);
+
       const projMat = view.projectionMatrix;
       const viewMat = invertView(fromXRTransform(view.transform));
-      renderScene(projMat, viewMat, vp.width, vp.height);
-      gl.viewport(vp.x, vp.y, vp.width, vp.height);
+      renderScene(projMat, viewMat, viewport.width, viewport.height);
     }
   }
   </script>
